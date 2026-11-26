@@ -239,39 +239,91 @@ def select_base_resume(tab, job):
     print(f"    Selected base resume: {filename}")
 
 
+JOBRIGHT_EDITOR_RE = r"add a new job for this page|job details are ready to review"
+
+
+def save_jobright_editor(tab, timeout=12):
+    """Save Jobright's parsed listing editor when its review panel is open."""
+    if not has_text(tab, JOBRIGHT_EDITOR_RE, timeout=0):
+        return False
+    save_button = find(tab, r"^\s*save\s*$", timeout=timeout,
+                       roles=("button",), match_text=False)
+    if not save_button:
+        return False
+    try:
+        save_button.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    clear_jobright_intercept(tab)
+    save_button.click(timeout=10000)
+    print("    clicked: Save Jobright listing", flush=True)
+    tab.wait_for_timeout(600)
+    return True
+
+
+def jobright_generate_button(tab):
+    """Make the add/save/retry path explicit before giving up on Jobright."""
+    failed = r"failed to analyze job"
+    for attempt in range(2):
+        if has_text(tab, failed, timeout=0):
+            if attempt:
+                break
+            if not click(tab, r"^\s*back\s*$", timeout=5,
+                         label="Back to Jobright job details"):
+                break
+            tab.wait_for_timeout(700)
+
+        editor = has_text(tab, JOBRIGHT_EDITOR_RE, timeout=0)
+        if editor:
+            if not save_jobright_editor(tab):
+                snap(tab, "jobright_save_missing")
+                return None
+            generate = find(tab, r"generate custom resume", timeout=45,
+                            roles=("button", "link"), match_text=True)
+            if generate:
+                return generate
+
+        generate = find(tab, r"generate custom resume", timeout=2,
+                        roles=("button", "link"), match_text=True)
+        if generate:
+            return generate
+
+        # The "Add This Job" prompt is a separate state from the parsed-job
+        # editor. Save the editor, then wait for Generate Custom Resume to appear.
+        added = click(tab, r"^\s*add this job\s*$", timeout=3,
+                      label="Add This Job")
+        if not added:
+            added = click(tab, r"add this job in one click", timeout=2,
+                          label="Add This Job")
+        if added:
+            if has_text(tab, JOBRIGHT_EDITOR_RE, timeout=15):
+                if not save_jobright_editor(tab, timeout=15):
+                    snap(tab, "jobright_save_missing")
+                    return None
+            generate = find(tab, r"generate custom resume", timeout=45,
+                            roles=("button", "link"), match_text=True)
+            if generate:
+                return generate
+
+        if attempt == 0 and has_text(tab, failed, timeout=0):
+            continue
+        break
+    return None
+
+
 def jobright_resume_flow(tab, job):
     """Generate a resume and return the tab running the resume flow."""
     existing_pages = set(tab.context.pages)
     click(tab, r"^\s*(decline all|reject all|reject optional cookies)\s*$", timeout=2)
-    # An interrupted prior run can leave the Add Job editor open.
-    if has_text(tab, r"^add a new job for this page$", timeout=0):
-        save_button = find(tab, r"^\s*save\s*$", timeout=5, roles=("button",), match_text=False)
-        if not save_button:
-            return None
-        save_button.click(timeout=25000)
-        print('    Saved existing Jobright listing editor')
-        added = True
-    else:
-        # Some listings open Jobright's blocking prompt instead of showing
-        # Generate Custom Resume. Add the listing first, then resume generation
-        # becomes available. Handle both the popup's short label and older copy.
-        added = click(tab, r"^\s*add this job\s*$", timeout=2, label="Add This Job")
-        if not added:
-            added = click(tab, r"add this job in one click", timeout=2, label="Add This Job")
-    if not added and not click(tab, r"generate custom resume", timeout=25):
+    generate = jobright_generate_button(tab)
+    if not generate:
+        # If analysis failed, one Back-and-retry pass is handled by
+        # jobright_generate_button. Never continue toward Submit without a
+        # completed Jobright resume.
         snap(tab, "no_generate_custom_resume")
         return None
-    if added or click(tab, r"^\s*add this job\s*$", timeout=5, label="Add This Job"):
-        if has_text(tab, r"^add a new job for this page$", timeout=10):
-            save_button = find(tab, r"^\s*save\s*$", timeout=15, roles=("button",), match_text=False)
-            if not save_button:
-                snap(tab, "jobright_save_missing")
-                return None
-            save_button.click(timeout=25000)
-            print("    clicked: Save Jobright listing")
-        if not click(tab, r"generate custom resume", timeout=60):
-            snap(tab, "jobright_resume_missing_after_save")
-            return None
+    generate.click(timeout=12000)
+    print("    clicked: Generate Custom Resume", flush=True)
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
         resume_tab = next((page for page in tab.context.pages if page not in existing_pages
@@ -332,33 +384,42 @@ def reset_password_via_gmail(ctx, new_password):
 
 def account_step(ctx, page, password):
     """create account -> sign in (-> reset password if creds rejected)."""
-    # A footer's 'sign up' is not an account form. Social-login completion
-    # screens also need profile fields, not another password submission.
-    if not page.locator('input[type=password]:visible').count():
+    # Only act on actual password-form buttons. Broad text matching was
+    # mistaking a repeated "Register" heading/link on multi-step portals for
+    # an account action and clicking it on every application step.
+    password_fields = page.locator('input[type=password]:visible')
+    if not password_fields.count():
         return
-    if has_text(page, r"create (an )?account|sign up|register", timeout=2):
+    create = find(page, r"^\s*(?:create (?:an )?account|sign up|register)\s*$",
+                  timeout=0, roles=("button",), match_text=False)
+    sign_in = find(page, r"^\s*(?:sign in|log in)\s*$",
+                   timeout=0, roles=("button",), match_text=False)
+    if create:
         for sel in ("input[type=email]", "input[name*=mail i]", "input[autocomplete=username]"):
             f = page.locator(sel).first
             if f.count() and f.is_visible():
                 f.fill(EMAIL)
                 break
-        pw = page.locator("input[type=password]")
-        for i in range(pw.count()):
-            if pw.nth(i).is_visible():
-                pw.nth(i).fill(password)
-        click(page, r"create (an )?account|sign up|register", timeout=3)
+        for field in password_fields.all():
+            if field.is_visible():
+                field.fill(password)
+        create.click(timeout=5000)
+        print("    clicked: Create Account", flush=True)
         time.sleep(3)
+        if not page.locator('input[type=password]:visible').count():
+            return
 
-    if has_text(page, r"sign in|log in", timeout=2) and page.locator("input[type=password]").count():
-        pw = page.locator("input[type=password]").first
+    sign_in = find(page, r"^\s*(?:sign in|log in)\s*$",
+                   timeout=0, roles=("button",), match_text=False)
+    if sign_in and page.locator('input[type=password]:visible').count():
         for sel in ("input[type=email]", "input[name*=mail i]", "input[autocomplete=username]"):
             f = page.locator(sel).first
             if f.count() and f.is_visible():
                 f.fill(EMAIL)
                 break
-        if pw.is_visible():
-            pw.fill(password)
-        click(page, r"sign in|log in", timeout=3)
+        page.locator('input[type=password]:visible').first.fill(password)
+        sign_in.click(timeout=5000)
+        print("    clicked: Sign In", flush=True)
         time.sleep(3)
         if has_text(page, r"incorrect|invalid|wrong|does ?n.t match|not recognized|try again", timeout=3):
             if click(page, r"reset|forgot", timeout=3):
@@ -533,6 +594,46 @@ def form_errors(page):
         except Exception:
             continue
     return list(dict.fromkeys(messages))
+
+
+def missing_required_fields(page):
+    """List visible, unanswered required controls so blank autofill cannot pass."""
+    missing = []
+    radio_checked = {}
+    for frame in page.frames:
+        try:
+            radio_checked.update(frame.locator('input[type=radio]:visible').evaluate_all(
+                "els => Object.fromEntries([...new Set(els.map(e => e.name).filter(Boolean))].map(n => [n, els.some(e => e.name === n && e.checked)]))"))
+        except Exception:
+            pass
+        try:
+            fields = frame.locator(
+                'input:visible[required],select:visible[required],textarea:visible[required],'
+                'input:visible[aria-required="true"],select:visible[aria-required="true"],'
+                'textarea:visible[aria-required="true"]')
+            for field in fields.all()[:60]:
+                try:
+                    kind = (field.get_attribute('type') or '').lower()
+                    name = field.get_attribute('name') or ''
+                    if kind == 'file':
+                        continue  # Resume attachment is checked separately at Submit.
+                    if kind == 'radio' and name and radio_checked.get(name):
+                        continue
+                    value = field.evaluate(
+                        "e => (e.type === 'checkbox' || e.type === 'radio') ? e.checked : e.value")
+                    if value is not True and not str(value or '').strip():
+                        label = field.get_attribute('aria-label') or field.get_attribute('placeholder') or name
+                        if not label:
+                            label = field.evaluate(
+                                "e => Array.from(e.labels || []).map(l => l.textContent.trim()).join(' ') || "
+                                "(e.getAttribute('aria-labelledby') || '').split(/\\s+/).map(id => "
+                                "document.getElementById(id)?.textContent || '').join(' ')")
+                        missing.append((label or 'Required field').strip()[:180])
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return list(dict.fromkeys(missing))
 
 
 def application_outcome(page):
@@ -726,6 +827,12 @@ def application_loop(ctx, page, password, dry_run):
         outcome = application_outcome(page)
         if outcome:
             return outcome
+        if has_text(page, r"are you still with us|session will (?:end|expire)", timeout=0):
+            if click(page, r"^\s*continue working\s*$", timeout=5,
+                     label="Continue Working"):
+                page.wait_for_timeout(750)
+                continue
+            return "session_keepalive_required"
         if '/authcode/noaccess' in page.url.lower():
             return 'portal_access_denied'
         if 'Planned Outage' in page.title():
@@ -775,6 +882,27 @@ def application_loop(ctx, page, password, dry_run):
             print('    Autofill unavailable; checking employer navigation')
 
         apply_confirmed_answers(page)
+        missing = missing_required_fields(page)
+        if missing and autofill:
+            # A visible Autofill button can finish without populating any of
+            # the required fields (seen on Lever). Retry once, then leave the
+            # tab open with the missing labels instead of advancing blank data.
+            print("    Required fields remain blank after Autofill; retrying once:", missing)
+            page.bring_to_front()
+            clear_jobright_intercept(page)
+            autofill_retry = find(page, r'^\s*(?:account creation & )?autofill\s*$',
+                                  timeout=2, roles=('button',), match_text=False)
+            if autofill_retry and autofill_retry.is_enabled():
+                autofill_retry.click(timeout=8000)
+                print("    clicked: Autofill retry", flush=True)
+                if not wait_for_autofill(page):
+                    return "autofill_timeout"
+                apply_confirmed_answers(page)
+                missing = missing_required_fields(page)
+        if missing:
+            print("    Required answers still missing; leaving this application open:", missing)
+            snap(page, "required_answers_needed")
+            return "required_answers_needed"
 
         forward = find(page, r"^\s*(?:save (?:and|&) )?(?:continue(?: to the next page)?|next)\s*$",
                        timeout=7, roles=("button", "link"), match_text=False)
@@ -862,15 +990,52 @@ def process_job(ctx, list_page, job, password, dry_run):
 
     print("    Opening Jobright and preparing a tailored resume")
     resume_tab = jobright_resume_flow(job_tab, job)
+    apply_tab = job_tab
+    apply_tab_preopened = False
     if resume_tab is None:
-        return "no_jobright_panel", [job_tab]
+        # Some ATS pages only expose Jobright after opening their application
+        # form. Open Apply, then retry the custom-resume flow on that page. Never
+        # continue to Autofill or Submit unless a custom resume is generated.
+        apply_control = find(job_tab, r"^\s*(?:apply|apply now|apply for this position)\s*$",
+                             timeout=4, roles=("button", "link"), match_text=False)
+        if not apply_control:
+            return "no_jobright_panel", [job_tab]
+        print("    Jobright was unavailable on the listing; opening employer Apply to retry")
+        try:
+            existing_pages = set(ctx.pages)
+            href = apply_control.get_attribute("href")
+            if apply_control.get_attribute("target") == "_self" and href:
+                job_tab.goto(href, wait_until="domcontentloaded", timeout=20000)
+                apply_tab = job_tab
+            else:
+                apply_control.click(timeout=10000)
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    new_tab = next((page for page in ctx.pages
+                                    if page not in existing_pages and not page.is_closed()), None)
+                    if new_tab:
+                        apply_tab = new_tab
+                        break
+                    job_tab.wait_for_timeout(250)
+                if apply_tab is job_tab:
+                    apply_tab.wait_for_load_state("domcontentloaded", timeout=10000)
+            apply_tab.wait_for_timeout(800)
+            resume_tab = jobright_resume_flow(apply_tab, job)
+            apply_tab_preopened = True
+        except Exception as error:
+            print(f"    Employer Apply fallback failed: {str(error).splitlines()[0]}")
+            snap(apply_tab, "employer_apply_fallback_failed")
+            return "custom_resume_unavailable", list(dict.fromkeys([apply_tab, job_tab]))
+        if resume_tab is None:
+            snap(apply_tab, "custom_resume_unavailable_after_apply")
+            return "custom_resume_unavailable", list(dict.fromkeys([apply_tab, job_tab]))
 
     print("    Opening the employer application form")
-    apply_tab = job_tab
     try:
         if click(resume_tab, r"^continue to autofill$", timeout=90):
-            on_form = find(job_tab, r"^submit application$", timeout=3, roles=("button",), match_text=False)
-            if not on_form:
+            on_form = find(apply_tab, r"^submit application$", timeout=3,
+                           roles=("button",), match_text=False)
+            if not apply_tab_preopened and not on_form:
                 apply_control = find(job_tab, r"^\s*(?:apply(?: now| for this (?:job|position))?(?:\s*:\s*.+)?|i['’]m interested)\s*$", timeout=10,
                                      match_text=False)
                 if not apply_control:
@@ -1018,12 +1183,15 @@ def main():
                 "validation_required": "The employer displayed validation errors after Submit; submission is not confirmed.",
                 "no_jobright_panel": "Jobright could not complete the resume flow. See the most recent Jobright debug capture.",
                 "custom_resume_not_ready": "Jobright did not show the completed resume handoff. The employer application was not advanced.",
+                "custom_resume_unavailable": "Apply was opened, but Jobright still could not generate the required custom resume.",
                 "no_apply_now": "The bot could not open the employer application form.",
                 "policy_review_required": "The employer requires a policy or privacy choice.",
                 "email_verification_required": "The employer verification code could not be matched or accepted.",
                 "google_sign_in_required": "Google sign-in did not return to the employer portal.",
                 "autofill_unavailable": "Jobright's Autofill button was unavailable.",
                 "autofill_timeout": "Jobright still showed Autofilling when the wait expired.",
+                "required_answers_needed": "Required fields remained blank after one Autofill retry.",
+                "session_keepalive_required": "The employer session needs manual reactivation.",
                 "submit_disabled": "The employer's Submit button was disabled.",
                 "stuck": "The form offered no usable Continue or Submit control.",
                 "applied?": "Submit was clicked, but the employer did not display a confirmation.",
