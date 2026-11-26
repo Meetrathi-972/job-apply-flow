@@ -96,11 +96,11 @@ def fetch_jobs():
 
 
 def load_state():
-    return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    return json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ============================ CHROME / PLAYWRIGHT =============================
@@ -651,6 +651,21 @@ def missing_required_fields(page):
                     value = field.evaluate(
                         "e => (e.type === 'checkbox' || e.type === 'radio') ? e.checked : e.value")
                     if value is not True and not str(value or '').strip():
+                        # Greenhouse uses react-select comboboxes whose hidden
+                        # input value stays empty even after a real option has
+                        # been selected. Read the rendered value container
+                        # before reporting the field as missing; otherwise we
+                        # retry Jobright Autofill and its completion dashboard
+                        # can intercept the retry click despite the form being
+                        # complete.
+                        selected = field.evaluate("""e => {
+                          if (e.getAttribute('role') !== 'combobox' &&
+                              !e.classList.contains('select__input')) return '';
+                          const box = e.closest('.select__control')?.querySelector('.select__value-container');
+                          return box?.innerText?.trim() || '';
+                        }""")
+                        if selected:
+                            continue
                         label = field.get_attribute('aria-label') or field.get_attribute('placeholder') or name
                         if not label:
                             label = field.evaluate(
