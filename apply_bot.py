@@ -60,8 +60,28 @@ OTP_SENDERS = {
     "hdow.fa.us6.oraclecloud.com": "hdow.fa.sender@workflow.email.us-ashburn-1.ocs.oraclecloud.com",
 }
 STATE_FILE = Path("applied.json")
+RUN_LOG = Path("application-run.log")
 DEBUG_DIR = Path("debug")
 # ----------------------------------------------------------------------------
+
+
+class Tee:
+    """Write run progress to the console and a persistent UTF-8 log."""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, value):
+        for stream in self.streams:
+            stream.write(value)
+            stream.flush()
+        return len(value)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
 
 
 # ============================ JOB LIST PARSING ================================
@@ -1148,6 +1168,10 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
         except (AttributeError, OSError):
             pass
+    log_stream = RUN_LOG.open("a", encoding="utf-8", buffering=1)
+    sys.stdout = Tee(sys.stdout, log_stream)
+    sys.stderr = Tee(sys.stderr, log_stream)
+    print(f"\n=== Run started {time.strftime('%Y-%m-%d %H:%M:%S %Z')} ===")
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["setup", "list", "run"])
     ap.add_argument("--limit", type=int, default=10)
