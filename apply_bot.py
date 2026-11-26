@@ -800,7 +800,10 @@ def application_loop(ctx, page, password, dry_run):
                       roles=("button",), match_text=False)
         if submit:
             for frame in page.frames:
-                attachments = frame.get_by_role('group', name=re.compile(r'^Resume(?:/CV)?\*?$'))
+                # Escape the slash: Playwright serializes name regexes as JS
+                # selectors, where an unescaped `/` prematurely ends the regex.
+                attachments = frame.get_by_role(
+                    'group', name=re.compile(r'^(?:Resume|Resume\/CV)\*?$'))
                 for attachment in attachments.all():
                     base_resume_pattern = (re.escape(RESUME_PREFIX) + r".*SkillBank"
                                            if RESUME_PREFIX else r"\S+_Resume_.*SkillBank")
@@ -900,6 +903,13 @@ def process_job(ctx, list_page, job, password, dry_run):
 
 # ============================ MAIN ============================================
 def main():
+    # Job titles from the README may contain emoji. Windows PowerShell can
+    # otherwise give Python a cp1252 stdout that raises during normal logging.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, OSError):
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["setup", "list", "run"])
     ap.add_argument("--limit", type=int, default=10)
@@ -970,15 +980,26 @@ def main():
         browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{DEBUG_PORT}")
         ctx = browser.contexts[0]
         list_page = next((page for page in ctx.pages if page.url.split("#", 1)[0] == LIST_URL.split("#", 1)[0]), None)
-        if list_page is None:
+        def ensure_list_page(page):
+            nonlocal list_page
+            try:
+                if page is not None and not page.is_closed():
+                    page.bring_to_front()
+                    return page
+            except Exception:
+                pass
+            print("    README tab was closed; reopening the job list")
             list_page = ctx.new_page()
-        list_page.goto(LIST_URL)
-        list_page.wait_for_load_state("domcontentloaded")
+            list_page.goto(LIST_URL, wait_until="domcontentloaded", timeout=30000)
+            return list_page
+
+        list_page = ensure_list_page(list_page)
 
         for n, job in enumerate(todo[:args.limit], 1):
             print(f"\n[{n}/{min(args.limit, len(todo))}] {job['company']} - {job['title']}")
             tabs = []
             try:
+                list_page = ensure_list_page(list_page)
                 status, tabs = process_job(ctx, list_page, job, password, args.dry_run)
             except Exception as e:
                 status = f"error: {e}"
@@ -1017,7 +1038,7 @@ def main():
                 print("Batch paused while Jobright is still autofilling.")
                 break
 
-            list_page.bring_to_front()
+            list_page = ensure_list_page(list_page)
             if not args.dry_run and status == "applied":
                 click(list_page, r"yes,? i applied|^yes$", timeout=4, label="Yes, I applied")
             if status in ("applied", "dry_run"):   # leave unconfirmed tabs open for review
