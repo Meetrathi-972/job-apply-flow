@@ -221,6 +221,10 @@ def has_text(page, pattern, timeout=1):
 # ============================ FLOW STEPS ======================================
 def select_base_resume(tab, job):
     """Pick and verify a named resume in Jobright's resume editor."""
+    # The editor often opens as a background tab with a zero-sized viewport.
+    # Bring it forward before interacting with the resume selector.
+    tab.bring_to_front()
+    tab.wait_for_timeout(250)
     title = job["title"]
     track = next((name for pattern, name in RESUME_RULES if re.search(pattern, title, re.I)), None)
     if track is None:
@@ -242,13 +246,29 @@ def select_base_resume(tab, job):
 JOBRIGHT_EDITOR_RE = r"add a new job for this page|job details are ready to review"
 
 
-def save_jobright_editor(tab, timeout=12):
-    """Save Jobright's parsed listing editor when its review panel is open."""
-    if not has_text(tab, JOBRIGHT_EDITOR_RE, timeout=0):
-        return False
-    save_button = find(tab, r"^\s*save\s*$", timeout=timeout,
+def jobright_editor_open(tab):
+    if has_text(tab, JOBRIGHT_EDITOR_RE, timeout=0):
+        return True
+    # The extension sometimes puts this editor in an isolated shadow frame;
+    # its Save button is visible to Playwright while the frame text is not.
+    save_button = find(tab, r"^\s*save\s*$", timeout=0,
                        roles=("button",), match_text=False)
     if not save_button:
+        return False
+    try:
+        panel_text = save_button.evaluate(
+            "e => (e.parentElement?.parentElement?.innerText || '') + ' ' + "
+            "(e.getRootNode()?.host?.innerText || '')")
+        return bool(re.search(JOBRIGHT_EDITOR_RE, panel_text, re.I))
+    except Exception:
+        return False
+
+
+def save_jobright_editor(tab, timeout=12):
+    """Save Jobright's parsed listing editor when its review panel is open."""
+    save_button = find(tab, r"^\s*save\s*$", timeout=timeout,
+                       roles=("button",), match_text=False)
+    if not save_button or not jobright_editor_open(tab):
         return False
     try:
         save_button.scroll_into_view_if_needed(timeout=3000)
@@ -273,7 +293,16 @@ def jobright_generate_button(tab):
                 break
             tab.wait_for_timeout(700)
 
-        editor = has_text(tab, JOBRIGHT_EDITOR_RE, timeout=0)
+        # Jobright can show an "Add This Job" modal over a Generate Custom
+        # Resume button. Dismiss that prompt first, then save the parsed job.
+        add_prompt = find(tab, r"^\s*add this job\s*$", timeout=0,
+                          roles=("button",), match_text=False)
+        if add_prompt:
+            click(tab, r"^\s*add this job\s*$", timeout=1,
+                  label="Add This Job")
+            tab.wait_for_timeout(700)
+
+        editor = jobright_editor_open(tab)
         if editor:
             if not save_jobright_editor(tab):
                 snap(tab, "jobright_save_missing")
@@ -296,7 +325,7 @@ def jobright_generate_button(tab):
             added = click(tab, r"add this job in one click", timeout=2,
                           label="Add This Job")
         if added:
-            if has_text(tab, JOBRIGHT_EDITOR_RE, timeout=15):
+            if jobright_editor_open(tab):
                 if not save_jobright_editor(tab, timeout=15):
                     snap(tab, "jobright_save_missing")
                     return None
@@ -636,6 +665,30 @@ def missing_required_fields(page):
     return list(dict.fromkeys(missing))
 
 
+def required_consent_missing(page):
+    """Do not accept legal/privacy statements for the applicant."""
+    patterns = (
+        r"terms and conditions|terms of use",
+        r"privacy notice|privacy policy|privacy terms|recruitment privacy|data processing consent",
+        r"background check|fingerprint",
+    )
+    for frame in page.frames:
+        for pattern in patterns:
+            try:
+                boxes = frame.get_by_role("checkbox", name=re.compile(pattern, re.I))
+                for box in boxes.all():
+                    try:
+                        required = (box.get_attribute("required") is not None or
+                                    box.get_attribute("aria-required") == "true")
+                        if required and not box.is_checked():
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+    return False
+
+
 def application_outcome(page):
     # Read both accessible content and rendered text. Some portals (notably
     # Ashby) expose confirmation in a dialog's accessible label only.
@@ -903,6 +956,11 @@ def application_loop(ctx, page, password, dry_run):
             print("    Required answers still missing; leaving this application open:", missing)
             snap(page, "required_answers_needed")
             return "required_answers_needed"
+
+        if required_consent_missing(page):
+            print("    Required legal/privacy consent is unchecked; leaving it for the applicant")
+            snap(page, "consent_required")
+            return "consent_required"
 
         forward = find(page, r"^\s*(?:save (?:and|&) )?(?:continue(?: to the next page)?|next)\s*$",
                        timeout=7, roles=("button", "link"), match_text=False)
@@ -1186,6 +1244,7 @@ def main():
                 "custom_resume_unavailable": "Apply was opened, but Jobright still could not generate the required custom resume.",
                 "no_apply_now": "The bot could not open the employer application form.",
                 "policy_review_required": "The employer requires a policy or privacy choice.",
+                "consent_required": "A required legal or privacy checkbox needs the applicant's acknowledgment.",
                 "email_verification_required": "The employer verification code could not be matched or accepted.",
                 "google_sign_in_required": "Google sign-in did not return to the employer portal.",
                 "autofill_unavailable": "Jobright's Autofill button was unavailable.",
